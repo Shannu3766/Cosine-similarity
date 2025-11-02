@@ -25,23 +25,44 @@ def get_lora_parameters(model):
         if p.requires_grad:
             params.append(p)
     return params
-
 def evaluate(model, dataloader, device):
+    """General evaluation that supports both LM and QA tasks."""
     model.eval()
-    total=0; correct=0; loss_sum=0.0
-    criterion = torch.nn.CrossEntropyLoss()
+    losses = []
+    correct, total = 0, 0
+
     with torch.no_grad():
         for batch in dataloader:
-            inputs = {k: v.to(device) for k,v in batch.items() if k!='labels'}
-            labels = batch['labels'].to(device)
-            outputs = model(**inputs)
-            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
-            loss = criterion(logits, labels)
-            preds = logits.argmax(dim=-1)
-            total += labels.size(0)
-            correct += (preds==labels).sum().item()
-            loss_sum += loss.item() * labels.size(0)
-    return {'loss': loss_sum/total if total>0 else 0.0, 'accuracy': correct/total if total>0 else 0.0}
+            # Move tensors to device
+            batch = {k: v.to(device) for k, v in batch.items()}
+
+            # Case 1: Question Answering models
+            if "start_positions" in batch and "end_positions" in batch:
+                outputs = model(**batch)
+                loss = outputs.loss
+                losses.append(loss.item())
+
+                # crude span accuracy check
+                start_preds = torch.argmax(outputs.start_logits, dim=-1)
+                end_preds = torch.argmax(outputs.end_logits, dim=-1)
+                correct += ((start_preds == batch["start_positions"]) & (end_preds == batch["end_positions"])).float().sum().item()
+                total += batch["start_positions"].numel()
+
+            # Case 2: LM / classification with labels
+            elif "labels" in batch:
+                labels = batch["labels"]
+                inputs = {k: v for k, v in batch.items() if k != "labels"}
+                outputs = model(**inputs)
+                logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+                loss_fct = torch.nn.CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+                losses.append(loss.item())
+                preds = torch.argmax(logits, dim=-1)
+                correct += (preds == labels).float().sum().item()
+                total += labels.numel()
+
+    acc = correct / total if total > 0 else 0
+    return {"loss": sum(losses) / len(losses), "accuracy": acc}
 
 def enable_grad_for_linear_layers(model):
     """Temporarily enable gradients for all Linear layers for BI computation."""
