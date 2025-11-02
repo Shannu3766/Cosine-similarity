@@ -1,3 +1,6 @@
+from xml.parsers.expat import model
+
+from zmq import device
 import torch
 from tqdm import tqdm
 from .importance import compute_bi_importance_eq13
@@ -98,11 +101,26 @@ def fine_tune_lora_dynamic(
         total_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Training epoch {epoch}")
         for step, batch in enumerate(pbar):
-            inputs = {k: v.to(device) for k, v in batch.items() if k != 'labels'}
-            labels = batch['labels'].to(device)
-            outputs = model(**inputs)
-            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
-            loss = criterion(logits, labels)
+            # --- Flexible batch processing for both classification and QA ---
+            if "labels" in batch:
+                inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
+                labels = batch["labels"].to(device)
+                outputs = model(**inputs)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                loss = criterion(logits, labels)
+# Question Answering datasets (like SQuAD)
+            elif "start_positions" in batch and "end_positions" in batch:
+                inputs = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**inputs)
+                loss = outputs.loss
+            else:
+                raise KeyError("Batch must contain either 'labels' or 'start_positions'/'end_positions'")
+
+            # inputs = {k: v.to(device) for k, v in batch.items() if k != 'labels'}
+            # labels = batch['labels'].to(device)
+            # outputs = model(**inputs)
+            # logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+            # loss = criterion(logits, labels)
 
             optimizer.zero_grad()
             loss.backward()
