@@ -1,35 +1,42 @@
 import torch
 import torch.nn as nn
 import math
+import torch
+import torch.nn as nn
 
 class LoRALinear(nn.Module):
-    def __init__(self, orig_linear: nn.Linear, r: int = 4, alpha: int = 16, dropout: float = 0.0):
+    def __init__(self, orig, r=4, alpha=1.0, dropout=0.0):
         super().__init__()
-        assert isinstance(orig_linear, nn.Linear)
-        self.orig = orig_linear
-        self.r = int(r)
-        self.alpha = int(alpha)
-        self.scaling = self.alpha / max(1, self.r)
-        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self.orig = orig
+        self.in_features = orig.in_features
+        self.out_features = orig.out_features
+        self.r = r
+        self.alpha = alpha
+        self.dropout = nn.Dropout(dropout)
+        self.scaling = self.alpha / self.r if self.r > 0 else 1.0
 
-        if self.r > 0:
-            device = orig_linear.weight.device
-            self.A = nn.Parameter(torch.zeros(self.r, orig_linear.in_features, device=device))
-            self.B = nn.Parameter(torch.zeros(orig_linear.out_features, self.r, device=device))
-            nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
-            nn.init.zeros_(self.B)
+        if r > 0:
+            # Match dtype and device with original layer weights
+            dtype = orig.weight.dtype
+            device = orig.weight.device
+            self.A = nn.Parameter(torch.randn(r, self.in_features, dtype=dtype, device=device) * 0.01)
+            self.B = nn.Parameter(torch.randn(self.out_features, r, dtype=dtype, device=device) * 0.01)
         else:
-            self.register_parameter('A', None)
-            self.register_parameter('B', None)
+            self.register_parameter("A", None)
+            self.register_parameter("B", None)
 
     def forward(self, x):
         out = self.orig(x)
         if self.r > 0:
-            lora_mid = torch.matmul(x, self.A.t())
-            lora_out = torch.matmul(lora_mid, self.B.t())
+            # Ensure dtype consistency
+            A_t = self.A.t().to(x.dtype)
+            B_t = self.B.t().to(x.dtype)
+            lora_mid = torch.matmul(x, A_t)
+            lora_out = torch.matmul(lora_mid, B_t)
             lora_out = self.dropout(lora_out) * self.scaling
             out = out + lora_out
         return out
+
 
 def _find_module_by_name(model, name):
     parts = name.split('.')
