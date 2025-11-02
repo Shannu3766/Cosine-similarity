@@ -40,6 +40,13 @@ def evaluate(model, dataloader, device):
             loss_sum += loss.item() * labels.size(0)
     return {'loss': loss_sum/total if total>0 else 0.0, 'accuracy': correct/total if total>0 else 0.0}
 
+def enable_grad_for_linear_layers(model):
+    """Temporarily enable gradients for all Linear layers for BI computation."""
+    for m in model.modules():
+        if isinstance(m, torch.nn.Linear):
+            for p in m.parameters():
+                p.requires_grad = True
+
 def fine_tune_lora_dynamic(
     model,
     train_loader,
@@ -65,6 +72,7 @@ def fine_tune_lora_dynamic(
         print(f"\n=== Epoch {epoch}/{epochs} ===")
         if (epoch-1) % recompute_every == 0:
             print("Computing BI importance (Eq.1.3)...")
+            enable_grad_for_linear_layers(model)
             module_names, scores = compute_bi_importance_eq13(
                 model, val_loader if val_loader is not None else train_loader, device=device,
                 max_batches=max_batches_for_bi,
