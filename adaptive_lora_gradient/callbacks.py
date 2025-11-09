@@ -144,7 +144,7 @@
 import os
 import logging
 from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
-from .importance import compute_cosine_similarity_scores
+from .importance import compute_gradient_importance_scores
 from .allocation import allocate_ranks_bi
 from .utils import get_lora_layers, save_epoch_log
 
@@ -202,7 +202,7 @@ class AdaptiveLoRACallback(TrainerCallback):
         # 1️⃣ Compute BI scores BEFORE training
         if self.verbose:
             print("Computing BI importance scores (pre-training)...")
-        scores = compute_cosine_similarity_scores(model, self.val_dataloader, device)
+        scores = compute_gradient_importance_scores(model, self.val_dataloader, device)
         if not scores:
             if self.verbose:
                 print("⚠️ No LoRA layers or BI scores found. Skipping rank update.")

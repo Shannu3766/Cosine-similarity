@@ -5,7 +5,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def compute_bi_compute_cosine_similarity_scoresscores(model: torch.nn.Module, dataloader: DataLoader, device: torch.device, num_batches: int = 3) -> Dict[str, float]:
+def compute_gradient_importance_scores(model: torch.nn.Module, dataloader: DataLoader, device: torch.device, num_batches: int = 3) -> Dict[str, float]:
     """
     Compute importance scores s_i using the formula:
         s_i = (1/K) * sum_{k=1..K} (dL/dh_i^{(k)} · h_i^{(k)})
