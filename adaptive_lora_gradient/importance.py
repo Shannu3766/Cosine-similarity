@@ -1,8 +1,8 @@
 import torch
 from torch.utils.data import DataLoader
-from typing import Dict
+from typing import Dict, Optional
 import logging
-from tqdm.auto import tqdm  # <--- 1. Import tqdm
+from tqdm.auto import tqdm
 from .utils import get_lora_layers
 
 logger = logging.getLogger(__name__)
@@ -11,11 +11,12 @@ def compute_gradient_importance_scores(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    num_batches: int = 2,
+    num_batches: Optional[int] = None, # <--- Modified: None means "Process All"
     batch_size: int = 8
 ) -> Dict[str, float]:
     """
-    Computes per-layer importance scores with a progress bar.
+    Computes per-layer importance scores using the dataset.
+    If num_batches is None, processes the ENTIRE dataset.
     """
     model.eval()
     lora_layers = get_lora_layers(model)
@@ -59,19 +60,24 @@ def compute_gradient_importance_scores(
         except Exception as e:
             logger.warning(f"Failed to register hook for {name}: {e}")
 
-    data_iter = iter(dataloader)
     model.zero_grad(set_to_none=True)
     batches_used = 0
 
+    # ============================================================
+    # 🆕 Logic: Determine Total Steps for Progress Bar
+    # ============================================================
+    if num_batches is None:
+        total_steps = len(dataloader)
+    else:
+        total_steps = min(num_batches, len(dataloader))
+
     # 3. Forward + Backward Loop
-    limit = min(num_batches, len(dataloader))
-    
     with torch.enable_grad():
-        # 🆕 Wrapped range in tqdm
-        for _ in tqdm(range(limit), desc="Computing Importance Scores", leave=False):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
+        # 🆕 Iterate directly over dataloader with enumerate
+        for step, batch in tqdm(enumerate(dataloader), total=total_steps, desc="Computing Importance", leave=False):
+            
+            # Stop if we hit the user-defined limit (if any)
+            if num_batches is not None and step >= num_batches:
                 break
 
             # Handle BatchEncoding / Dict / List
@@ -110,6 +116,7 @@ def compute_gradient_importance_scores(
             batches_used += 1
 
     # 4. Compute Scores
+    # ... (Rest of your existing scoring logic remains identical) ...
     raw_scores = {}
     for name, acts in activations.items():
         if not acts:
