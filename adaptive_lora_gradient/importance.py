@@ -1,7 +1,6 @@
-
 import torch
 from torch.utils.data import DataLoader
-from typing import Dict
+from typing import Dict, Union
 import logging
 from .utils import get_lora_layers
 
@@ -11,22 +10,18 @@ def compute_gradient_importance_scores(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    num_batches: int = 2
+    num_batches: int = 2,
+    batch_size: int = 8 
 ) -> Dict[str, float]:
     """
-    Computes per-layer importance scores using:
-        s_i = (1/K) * Σ_k [ (∂L/∂h_i^(k)) · h_i^(k) ]
+    Computes per-layer importance scores using gradient-activation dot products.
     
-    where h_i^(k) is the activation output of LoRA layer i for sample k.
-
     Args:
-        model: PEFT-wrapped model (with LoRA layers).
-        dataloader: Validation DataLoader (small subset).
-        device: torch.device (GPU or CPU).
-        num_batches: number of batches to sample for averaging (K).
-    
-    Returns:
-        Dict[str, float]: Normalized importance score per layer.
+        model: PEFT-wrapped model.
+        dataloader: Validation DataLoader.
+        device: torch.device.
+        num_batches: number of batches to sample.
+        batch_size: The batch size to use for this specific computation. Defaults to 8.
     """
     model.eval()
     lora_layers = get_lora_layers(model)
@@ -34,12 +29,28 @@ def compute_gradient_importance_scores(
         logger.warning("No LoRA layers found. Returning empty scores.")
         return {}
 
+    # ============================================================
+    # 🆕 Logic: Apply default batch size (8) if different from input
+    # ============================================================
+    # We only recreate the loader if the requested batch_size (8) 
+    # is different from what the dataloader already has.
+    if batch_size != dataloader.batch_size:
+        logger.info(f"Adjusting DataLoader batch size from {dataloader.batch_size} to {batch_size}")
+        dataloader = DataLoader(
+            dataset=dataloader.dataset,
+            batch_size=batch_size,
+            shuffle=False, 
+            collate_fn=dataloader.collate_fn, 
+            num_workers=dataloader.num_workers,
+            pin_memory=dataloader.pin_memory
+        )
+
     # Storage for activations and hooks
     activations = {name: [] for name in lora_layers.keys()}
     hooks = []
 
     # ============================================================
-    # ✅ Hook: retain gradients on original outputs (no detach)
+    # ✅ Hook: retain gradients on original outputs
     # ============================================================
     def make_hook(name):
         def hook(module, inp, out):
@@ -74,11 +85,19 @@ def compute_gradient_importance_scores(
             except StopIteration:
                 break
 
-            # Move tensors to device
-            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            # Handle list/tuple vs dict batches and move to device
+            if isinstance(batch, dict):
+                batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                outputs = model(**batch)
+            elif isinstance(batch, (list, tuple)):
+                batch = [b.to(device) for b in batch if isinstance(b, torch.Tensor)]
+                outputs = model(*batch)
+            else:
+                # Fallback for single tensor input
+                batch = batch.to(device)
+                outputs = model(batch)
 
-            # Ensure model outputs loss
-            outputs = model(**batch)
+            # Extract loss
             if isinstance(outputs, dict) and "loss" in outputs:
                 loss = outputs["loss"]
             elif hasattr(outputs, "loss"):
@@ -107,28 +126,26 @@ def compute_gradient_importance_scores(
             if act.grad is None:
                 continue
 
-            # Move to CPU for safety
             a = act.detach().cpu()
             g = act.grad.detach().cpu()
 
-            # Flatten last dim (hidden)
             if a.dim() < 2:
                 continue
+            
+            # Flatten to [batch * sequence, hidden_dim]
             hidden_dim = a.size(-1)
             a_flat = a.view(-1, hidden_dim)
             g_flat = g.view(-1, hidden_dim)
 
-            # Compute dot product per token, then mean
+            # Dot product
             dots = (a_flat * g_flat).sum(dim=1)
             per_layer_vals.append(dots.mean().item())
 
-            # Free memory early
             del a, g, a_flat, g_flat, dots
             torch.cuda.empty_cache()
 
         raw_scores[name] = float(sum(per_layer_vals) / len(per_layer_vals)) if per_layer_vals else 0.0
 
-    # Remove hooks
     for h in hooks:
         try:
             h.remove()

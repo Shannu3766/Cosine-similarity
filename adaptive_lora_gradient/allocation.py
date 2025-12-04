@@ -45,7 +45,8 @@ def allocate_ranks_bi(
     scores: Dict[str, float],
     total_rank: int,
     tau: float = 0.3,        # make distribution sharper
-    eps: float = 1e-8
+    eps: float = 1e-8,
+    min_rank:int=1,
 ) -> Dict[str, int]:
     """
     Allocates ranks to layers based on their BI importance scores.
