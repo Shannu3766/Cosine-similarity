@@ -11,12 +11,12 @@ def compute_gradient_importance_scores(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    num_batches: Optional[int] = None, # <--- Modified: None means "Process All"
-    batch_size: int = 8
+    num_batches: Optional[int] = None, # None = Process All
+    batch_size: int = 8                # Controls memory usage per step
 ) -> Dict[str, float]:
     """
-    Computes per-layer importance scores using the dataset.
-    If num_batches is None, processes the ENTIRE dataset.
+    Computes per-layer importance scores iteratively (Memory Safe).
+    Calculates (Activation * Gradient) per batch and accumulates the sum.
     """
     model.eval()
     lora_layers = get_lora_layers(model)
@@ -36,71 +36,62 @@ def compute_gradient_importance_scores(
             pin_memory=dataloader.pin_memory
         )
 
-    # Storage for activations
-    activations = {name: [] for name in lora_layers.keys()}
-    hooks = []
+    # Dictionary to hold the running total of importance scores
+    # accumulated_scores[layer_name] = cumulative_score
+    accumulated_scores = {name: 0.0 for name in lora_layers.keys()}
+    
+    # Temporary storage for the CURRENT batch's activations
+    current_batch_activations = {}
 
-    # 2. Register Hooks
+    # 2. Register Hooks (Overwrites storage per batch)
     def make_hook(name):
         def hook(module, inp, out):
+            # We only care about the output tensor
             if isinstance(out, torch.Tensor):
-                out.retain_grad()
-                activations[name].append(out)
+                out.retain_grad() # Crucial: enables .grad on non-leaf tensor
+                current_batch_activations[name] = out
             elif isinstance(out, (tuple, list)):
                 for elem in out:
                     if isinstance(elem, torch.Tensor):
                         elem.retain_grad()
-                        activations[name].append(elem)
+                        current_batch_activations[name] = elem
                         break
         return hook
 
+    hooks = []
     for name, layer in lora_layers.items():
         try:
             hooks.append(layer.register_forward_hook(make_hook(name)))
         except Exception as e:
             logger.warning(f"Failed to register hook for {name}: {e}")
 
+    # Determine loop length
+    total_steps = len(dataloader)
+    if num_batches is not None:
+        total_steps = min(num_batches, total_steps)
+
+    batches_processed = 0
+
+    # 3. Iterative Processing Loop
     model.zero_grad(set_to_none=True)
-    batches_used = 0
-
-    # ============================================================
-    # 🆕 Logic: Determine Total Steps for Progress Bar
-    # ============================================================
-    if num_batches is None:
-        total_steps = len(dataloader)
-    else:
-        total_steps = min(num_batches, len(dataloader))
-
-    # 3. Forward + Backward Loop
+    
     with torch.enable_grad():
-        # 🆕 Iterate directly over dataloader with enumerate
         for step, batch in tqdm(enumerate(dataloader), total=total_steps, desc="Computing Importance", leave=False):
             
-            # Stop if we hit the user-defined limit (if any)
             if num_batches is not None and step >= num_batches:
                 break
 
-            # Handle BatchEncoding / Dict / List
+            # --- A. Move Batch to Device ---
             if hasattr(batch, "items"):
-                batch_input = {
-                    k: v.to(device) for k, v in batch.items() 
-                    if isinstance(v, torch.Tensor)
-                }
+                batch_input = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
                 outputs = model(**batch_input)
-            
             elif isinstance(batch, (list, tuple)):
                 batch_input = [b.to(device) for b in batch if isinstance(b, torch.Tensor)]
                 outputs = model(*batch_input)
-            
-            else:
-                if isinstance(batch, torch.Tensor):
-                    batch_input = batch.to(device)
-                    outputs = model(batch_input)
-                else:
-                    logger.error(f"Unknown batch type: {type(batch)}. Skipping.")
-                    continue
+            else: # Tensor
+                outputs = model(batch.to(device))
 
-            # Extract loss
+            # --- B. Get Loss ---
             if isinstance(outputs, dict) and "loss" in outputs:
                 loss = outputs["loss"]
             elif hasattr(outputs, "loss"):
@@ -108,65 +99,62 @@ def compute_gradient_importance_scores(
             elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
                 loss = outputs[0]
             else:
-                logger.error("Model output has no loss. Ensure 'labels' in batch.")
                 continue
 
+            # --- C. Backward Pass ---
+            # This populates .grad on the tensors stored in current_batch_activations
+            loss.backward()
+
+            # --- D. Compute Score for this Batch IMMEDIATEY ---
+            # We calculate and add to total, then discard tensors to free memory.
+            for name, act in current_batch_activations.items():
+                if act.grad is None:
+                    continue
+
+                # Move to CPU to save GPU memory during math, or keep on GPU if speed is priority
+                # Using GPU (device) is faster, CPU is safer for VRAM.
+                # Here we keep on device for speed, assuming batch_size is small enough.
+                
+                # Flatten: [Batch, Seq_Len, Hidden] -> [N, Hidden]
+                a_flat = act.detach().view(-1, act.size(-1))
+                g_flat = act.grad.detach().view(-1, act.size(-1))
+
+                # Dot product: (Activation * Gradient)
+                # Sum across dimensions, then average over the batch
+                importance = (a_flat * g_flat).sum(dim=1).mean().item()
+                
+                # Add to running total
+                accumulated_scores[name] += importance
+
+            # --- E. Cleanup for Next Batch ---
+            # Clear references to release memory
+            current_batch_activations.clear()
             model.zero_grad(set_to_none=True)
-            loss.backward(retain_graph=False)
-            batches_used += 1
-
-    # 4. Compute Scores
-    # ... (Rest of your existing scoring logic remains identical) ...
-    raw_scores = {}
-    for name, acts in activations.items():
-        if not acts:
-            raw_scores[name] = 0.0
-            continue
-
-        per_layer_vals = []
-        for act in acts:
-            if act.grad is None:
-                continue
-
-            a = act.detach().cpu()
-            g = act.grad.detach().cpu()
-
-            if a.dim() < 2:
-                continue
+            batches_processed += 1
             
-            hidden_dim = a.size(-1)
-            a_flat = a.view(-1, hidden_dim)
-            g_flat = g.view(-1, hidden_dim)
+            # Explicit cache clear (optional, helps if VRAM is very tight)
+            # torch.cuda.empty_cache() 
 
-            dots = (a_flat * g_flat).sum(dim=1)
-            per_layer_vals.append(dots.mean().item())
-
-            del a, g, a_flat, g_flat, dots
-            torch.cuda.empty_cache()
-
-        raw_scores[name] = float(sum(per_layer_vals) / len(per_layer_vals)) if per_layer_vals else 0.0
-
-    # Cleanup
+    # Cleanup Hooks
     for h in hooks:
-        try:
-            h.remove()
-        except Exception:
-            pass
+        h.remove()
 
-    if batches_used == 0 or not raw_scores:
-        logger.warning("No batches processed. Returning zeros.")
+    if batches_processed == 0:
         return {k: 0.0 for k in lora_layers.keys()}
 
-    # 5. Normalize
-    s_vals = torch.tensor(list(raw_scores.values()), dtype=torch.float32)
+    # 4. Average and Normalize
+    # Divide cumulative sum by number of batches to get the average
+    final_scores = {k: v / batches_processed for k, v in accumulated_scores.items()}
+
+    s_vals = torch.tensor(list(final_scores.values()), dtype=torch.float32)
     eps = 1e-8
     s_min, s_max = s_vals.min(), s_vals.max()
 
     if (s_max - s_min) < eps:
-        normed = {k: 0.0 for k in raw_scores.keys()}
+        normed = {k: 0.0 for k in final_scores.keys()}
     else:
         s_norm = (s_vals - s_min) / (s_max - s_min)
-        normed = {k: float(v) for k, v in zip(raw_scores.keys(), s_norm)}
+        normed = {k: float(v) for k, v in zip(final_scores.keys(), s_norm)}
 
     model.train()
     return normed
