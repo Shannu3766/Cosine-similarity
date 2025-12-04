@@ -1,14 +1,8 @@
 import torch
 from torch.utils.data import DataLoader
-from typing import Dict, Union
-import logging
-from .utils import get_lora_layers
-
-logger = logging.getLogger(__name__)
-import torch
-from torch.utils.data import DataLoader
 from typing import Dict
 import logging
+from tqdm.auto import tqdm  # <--- 1. Import tqdm
 from .utils import get_lora_layers
 
 logger = logging.getLogger(__name__)
@@ -21,8 +15,7 @@ def compute_gradient_importance_scores(
     batch_size: int = 8
 ) -> Dict[str, float]:
     """
-    Computes per-layer importance scores.
-    Handles Hugging Face BatchEncoding correctly.
+    Computes per-layer importance scores with a progress bar.
     """
     model.eval()
     lora_layers = get_lora_layers(model)
@@ -71,33 +64,29 @@ def compute_gradient_importance_scores(
     batches_used = 0
 
     # 3. Forward + Backward Loop
+    limit = min(num_batches, len(dataloader))
+    
     with torch.enable_grad():
-        for _ in range(min(num_batches, len(dataloader))):
+        # 🆕 Wrapped range in tqdm
+        for _ in tqdm(range(limit), desc="Computing Importance Scores", leave=False):
             try:
                 batch = next(data_iter)
             except StopIteration:
                 break
 
-            # =======================================================
-            # 🛠️ FIX: Robust Batch Handling
-            # =======================================================
-            # Check if batch acts like a dict (covers dict, BatchEncoding, UserDict)
+            # Handle BatchEncoding / Dict / List
             if hasattr(batch, "items"):
-                # Create a clean dict with only tensors moved to device
                 batch_input = {
                     k: v.to(device) for k, v in batch.items() 
                     if isinstance(v, torch.Tensor)
                 }
-                # Unpack arguments (**kwargs)
                 outputs = model(**batch_input)
             
             elif isinstance(batch, (list, tuple)):
-                # Handle list/tuple inputs (e.g. image classification)
                 batch_input = [b.to(device) for b in batch if isinstance(b, torch.Tensor)]
                 outputs = model(*batch_input)
             
             else:
-                # Fallback for single tensor input
                 if isinstance(batch, torch.Tensor):
                     batch_input = batch.to(device)
                     outputs = model(batch_input)
@@ -158,7 +147,7 @@ def compute_gradient_importance_scores(
             pass
 
     if batches_used == 0 or not raw_scores:
-        logger.warning("No batches processed or no raw scores computed. Returning zeros.")
+        logger.warning("No batches processed. Returning zeros.")
         return {k: 0.0 for k in lora_layers.keys()}
 
     # 5. Normalize
