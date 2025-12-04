@@ -167,12 +167,14 @@ class AdaptiveLoRACallback(TrainerCallback):
         tau: float = 1.0,
         log_path: str = "./logs",
         verbose: bool = True,
+        lora_alpha:int=4,
     ):
         self.total_rank = total_rank
         self.val_dataloader = val_dataloader
         self.tau = tau
         self.verbose = verbose
         self.log_file = os.path.join(log_path, "adaptive_lora_epoch_logs.csv")
+        self.lora_alpha=lora_alpha
 
         os.makedirs(log_path, exist_ok=True)
 
@@ -256,7 +258,7 @@ class AdaptiveLoRACallback(TrainerCallback):
                 layer.update_layer(
                     adapter_name="default",
                     r=new_rank,
-                    lora_alpha=layer.lora_alpha.get("default", 1),
+                    lora_alpha=self.lora_alpha,
                     lora_dropout=lora_dropout_p,
                     init_lora_weights=init_lora_weights,
                     use_rslora=use_rslora,

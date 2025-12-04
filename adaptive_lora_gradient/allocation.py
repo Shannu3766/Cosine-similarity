@@ -92,6 +92,50 @@ def _largest_remainder_rounding(
 #     return {name: rank.item() for name, rank in zip(layer_names, final_ranks)}
 
 
+# def allocate_ranks_bi(
+#     scores: Dict[str, float],
+#     total_rank: int,
+#     tau: float = 0.3,        # make distribution sharper
+#     eps: float = 1e-8
+# ) -> Dict[str, int]:
+#     """
+#     Allocates ranks to layers based on their BI importance scores.
+#     Adds normalization and temperature sharpening to avoid uniform ranks.
+#     """
+#     if not scores:
+#         return {}
+
+#     layer_names = list(scores.keys())
+#     s = torch.tensor([scores[name] for name in layer_names], dtype=torch.float32)
+
+#     # --- 1️⃣ Normalize scores to [0, 1]
+#     s_min, s_max = s.min(), s.max()
+#     if (s_max - s_min) < eps:
+#         # all scores nearly equal → assign rank 1
+#         return {name: max(1, total_rank // len(scores)) for name in layer_names}
+#     # s_norm = (s - s_min) / (s_max - s_min)
+    
+
+#     # --- 2️⃣ Sharpen using temperature (smaller tau -> sharper)
+#     s_temp = s_norm / tau
+#     probs = torch.softmax(s_temp, dim=0)
+
+#     # --- 3️⃣ Allocate and round ranks
+#     raw_ranks = probs * total_rank
+#     int_ranks = torch.floor(raw_ranks).int()
+
+#     remainder = total_rank - int_ranks.sum()
+#     if remainder > 0:
+#         residuals = raw_ranks - int_ranks
+#         _, top_indices = torch.topk(residuals, k=int(remainder.item()))
+#         int_ranks[top_indices] += 1
+
+#     # --- 4️⃣ Ensure no layer gets zero rank
+#     int_ranks = torch.clamp(int_ranks, min=1)
+
+#     return {name: rank.item() for name, rank in zip(layer_names, int_ranks)}
+
+
 def allocate_ranks_bi(
     scores: Dict[str, float],
     total_rank: int,
@@ -100,7 +144,7 @@ def allocate_ranks_bi(
 ) -> Dict[str, int]:
     """
     Allocates ranks to layers based on their BI importance scores.
-    Adds normalization and temperature sharpening to avoid uniform ranks.
+    Includes normalization + temperature sharpening.
     """
     if not scores:
         return {}
@@ -110,13 +154,15 @@ def allocate_ranks_bi(
 
     # --- 1️⃣ Normalize scores to [0, 1]
     s_min, s_max = s.min(), s.max()
-    if (s_max - s_min) < eps:
-        # all scores nearly equal → assign rank 1
-        return {name: max(1, total_rank // len(scores)) for name in layer_names}
-    s_norm = (s - s_min) / (s_max - s_min)
 
-    # --- 2️⃣ Sharpen using temperature (smaller tau -> sharper)
-    s_temp = s_norm / tau
+    if (s_max - s_min) < eps:
+        # all scores equal → give uniform rank
+        uniform_rank = max(1, total_rank // len(scores))
+        return {name: uniform_rank for name in layer_names}
+
+    s = (s - s_min) / (s_max - s_min) 
+
+    s_temp = s / tau
     probs = torch.softmax(s_temp, dim=0)
 
     # --- 3️⃣ Allocate and round ranks
