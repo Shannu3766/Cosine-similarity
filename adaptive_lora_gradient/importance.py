@@ -1,7 +1,3 @@
-# ============================================================
-# adaptive_lora_gradient/importance.py
-# Gradient × Activation based Importance (s_i)
-# ============================================================
 
 import torch
 from torch.utils.data import DataLoader
