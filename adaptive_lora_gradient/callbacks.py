@@ -334,7 +334,6 @@
 #             if self.verbose:
 #                 print(f"📄 Epoch {epoch}: Rank allocations logged to {self.log_file}\n")
 
-
 import os
 import logging
 import torch
@@ -400,7 +399,6 @@ class AdaptiveLoRACallback(TrainerCallback):
             print(f"\n--- AdaptiveLoRA: Preparing ranks for Epoch {epoch} ---")
 
         # Use the device of the model parameters for importance calculation
-        # (compute_gradient_importance_scores handles moving batches internally)
         device = next(model.parameters()).device
 
         # 1️⃣ Compute BI scores BEFORE training
@@ -423,7 +421,7 @@ class AdaptiveLoRACallback(TrainerCallback):
             print("Allocating new ranks based on BI scores...")
         new_ranks = allocate_ranks_bi(scores, self.total_rank, self.tau, min_rank=self.min_rank)
 
-        # 3️⃣ Apply new ranks to LoRA layers with Naive Weight Transfer
+        # 3️⃣ Apply new ranks to LoRA layers
         if self.verbose:
             print("Applying new ranks to LoRA modules for this epoch...")
 
@@ -448,88 +446,79 @@ class AdaptiveLoRACallback(TrainerCallback):
             current_rank = layer.r.get("default", 0)
             score = scores.get(name, 0.0)
 
-            # Print status
+            # --- LOGGING ---
             if current_rank != new_rank:
                 if self.verbose:
                     print(f"  - {name}: r={current_rank} → {new_rank} (Score: {score:.4f})")
             else:
                 if self.verbose:
                     print(f"  - {name}: r={new_rank} (Unchanged, Score: {score:.4f})")
-                continue # Skip update if rank is unchanged
+                continue # Skip processing if rank is unchanged
 
-            # ----------------------------------------------------------------
-            # STEP 1: SAVE OLD WEIGHTS
-            # ----------------------------------------------------------------
-            # Clone them so they persist after layer update
-            old_A = layer.lora_A["default"].weight.data.clone()
-            old_B = layer.lora_B["default"].weight.data.clone()
+            # --- WEIGHT TRANSFER & UPDATE ---
+            if hasattr(layer, "update_layer"):
+                # 1. Save Old Weights
+                old_A = layer.lora_A["default"].weight.data.clone()
+                old_B = layer.lora_B["default"].weight.data.clone()
 
-            # ----------------------------------------------------------------
-            # STEP 2: UPDATE LAYER TOPOLOGY
-            # ----------------------------------------------------------------
-            lora_dropout_p = 0.0
-            if hasattr(layer, "lora_dropout") and "default" in layer.lora_dropout:
-                lora_dropout_p = layer.lora_dropout["default"].p
+                # 2. Update Layer (Let PEFT reset the shape, but NO INIT)
+                lora_dropout_p = 0.0
+                if hasattr(layer, "lora_dropout") and "default" in layer.lora_dropout:
+                    lora_dropout_p = layer.lora_dropout["default"].p
 
-            layer.update_layer(
-                adapter_name="default",
-                r=new_rank,
-                lora_alpha=self.lora_alpha,
-                lora_dropout=lora_dropout_p,
-                init_lora_weights=False,  # CRITICAL: Prevent random initialization
-                use_rslora=use_rslora,
-                use_dora=use_dora,
-                use_qalora=use_qalora,
-                lora_bias=lora_bias,
-                qalora_group_size=qalora_group_size,
-            )
+                layer.update_layer(
+                    adapter_name="default",
+                    r=new_rank,
+                    lora_alpha=self.lora_alpha,
+                    lora_dropout=lora_dropout_p,
+                    init_lora_weights=False,  # CRITICAL: Prevent random initialization
+                    use_rslora=use_rslora,
+                    use_dora=use_dora,
+                    use_qalora=use_qalora,
+                    lora_bias=lora_bias,
+                    qalora_group_size=qalora_group_size,
+                )
 
-            # ----------------------------------------------------------------
-            # STEP 3: NAIVE WEIGHT TRANSFER (PAD OR TRUNCATE)
-            # ----------------------------------------------------------------
-            with torch.no_grad():
-                # --- Handle Matrix A [rank, dim] ---
-                if new_rank > current_rank:
-                    # PAD: Keep old A, fill new rows with zeros
-                    pad_rows = new_rank - current_rank
-                    # FIX: Use old_A.device explicitly
-                    new_A_weight = torch.cat([
-                        old_A, 
-                        torch.zeros((pad_rows, old_A.shape[1]), device=old_A.device, dtype=old_A.dtype)
-                    ], dim=0)
-                else:
-                    # TRUNCATE: Keep top 'new_rank' rows
-                    new_A_weight = old_A[:new_rank, :]
+                # 3. Naive Weight Transfer (Pad or Truncate)
+                with torch.no_grad():
+                    # Use the device of the specific layer to prevent multi-GPU crashes
+                    target_device = old_A.device
 
-                # --- Handle Matrix B [dim, rank] ---
-                if new_rank > current_rank:
-                    # PAD: Keep old B, fill new cols with zeros
-                    pad_cols = new_rank - current_rank
-                    # FIX: Use old_B.device explicitly
-                    new_B_weight = torch.cat([
-                        old_B, 
-                        torch.zeros((old_B.shape[0], pad_cols), device=old_B.device, dtype=old_B.dtype)
-                    ], dim=1)
-                else:
-                    # TRUNCATE: Keep left 'new_rank' cols
-                    new_B_weight = old_B[:, :new_rank]
+                    # --- Handle Matrix A [rank, dim] ---
+                    if new_rank > current_rank:
+                        # PAD: Keep old A, fill new rows with zeros
+                        pad_rows = new_rank - current_rank
+                        new_A_weight = torch.cat([
+                            old_A, 
+                            torch.zeros((pad_rows, old_A.shape[1]), device=target_device, dtype=old_A.dtype)
+                        ], dim=0)
+                    else:
+                        # TRUNCATE: Keep top 'new_rank' rows
+                        new_A_weight = old_A[:new_rank, :]
 
-                # ----------------------------------------------------------------
-                # STEP 4: CORRECT FOR SCALING FACTOR CHANGE
-                # ----------------------------------------------------------------
-                # Formula: scale = r_new / r_old
-                # We multiply weights by sqrt(scale) so that (B*sqrt) * (A*sqrt) = BA * scale
-                # This compensates for PEFT's internal scaling (alpha/r) changing when r changes.
-                scale_adjustment = (new_rank / current_rank) ** 0.5
-                
-                new_A_weight = new_A_weight * scale_adjustment
-                new_B_weight = new_B_weight * scale_adjustment
+                    # --- Handle Matrix B [dim, rank] ---
+                    if new_rank > current_rank:
+                        # PAD: Keep old B, fill new cols with zeros
+                        pad_cols = new_rank - current_rank
+                        new_B_weight = torch.cat([
+                            old_B, 
+                            torch.zeros((old_B.shape[0], pad_cols), device=target_device, dtype=old_B.dtype)
+                        ], dim=1)
+                    else:
+                        # TRUNCATE: Keep left 'new_rank' cols
+                        new_B_weight = old_B[:, :new_rank]
 
-                # ----------------------------------------------------------------
-                # STEP 5: ASSIGN NEW WEIGHTS
-                # ----------------------------------------------------------------
-                layer.lora_A["default"].weight.copy_(new_A_weight)
-                layer.lora_B["default"].weight.copy_(new_B_weight)
+                    # 4. Correct for Scaling Factor Change
+                    # scale = r_new / r_old. We multiply weights by sqrt(scale)
+                    # so that (B*sqrt) * (A*sqrt) = BA * scale
+                    scale_adjustment = (new_rank / current_rank) ** 0.5
+                    
+                    new_A_weight = new_A_weight * scale_adjustment
+                    new_B_weight = new_B_weight * scale_adjustment
+
+                    # 5. Apply New Weights
+                    layer.lora_A["default"].weight.copy_(new_A_weight)
+                    layer.lora_B["default"].weight.copy_(new_B_weight)
 
         # Save for logging after training
         self.latest_scores = scores
