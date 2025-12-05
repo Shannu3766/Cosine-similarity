@@ -87,7 +87,7 @@ class AdaptiveLoRACallback(TrainerCallback):
             return
 
         # Extract config flags
-        init_lora_weights = getattr(config, "init_lora_weights", False)
+        init_lora_weights = getattr(config, "init_lora_weights", True)
         use_rslora = getattr(config, "use_rslora", False)
         use_dora = getattr(config, "use_dora", False)
         use_qalora = getattr(config, "use_qalora", False)
