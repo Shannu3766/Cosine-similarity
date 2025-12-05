@@ -159,22 +159,34 @@ logger = logging.getLogger(__name__)
 
 #     model.train()
 #     return normed
+import torch
+from torch.utils.data import DataLoader
+from typing import Dict, Optional
+import logging
+from tqdm.auto import tqdm
+from .utils import get_lora_layers
 
+logger = logging.getLogger(__name__)
 
 def compute_gradient_importance_scores(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    num_batches: Optional[int] = None,
-    batch_size: int = 8
+    num_batches: Optional[int] = None, # None = Process All
+    batch_size: int = 8                # Controls memory usage per step
 ) -> Dict[str, float]:
-
+    """
+    Computes per-layer importance scores iteratively.
+    Returns:
+        Dict[str, float]: NORMALIZED importance scores (0.0 to 1.0).
+    """
     model.eval()
     lora_layers = get_lora_layers(model)
     if not lora_layers:
         logger.warning("No LoRA layers found. Returning empty scores.")
         return {}
 
+    # 1. Adjust Batch Size if needed
     if batch_size != dataloader.batch_size:
         logger.info(f"Adjusting DataLoader batch size from {dataloader.batch_size} to {batch_size}")
         dataloader = DataLoader(
@@ -189,10 +201,11 @@ def compute_gradient_importance_scores(
     accumulated_scores = {name: 0.0 for name in lora_layers.keys()}
     current_batch_activations = {}
 
+    # 2. Register Hooks
     def make_hook(name):
         def hook(module, inp, out):
             if isinstance(out, torch.Tensor):
-                out.retain_grad()
+                out.retain_grad() 
                 current_batch_activations[name] = out
             elif isinstance(out, (tuple, list)):
                 for elem in out:
@@ -215,13 +228,13 @@ def compute_gradient_importance_scores(
 
     batches_processed = 0
     model.zero_grad(set_to_none=True)
-
+    
     with torch.enable_grad():
         for step, batch in tqdm(enumerate(dataloader), total=total_steps, desc="Computing Importance", leave=False):
-
             if num_batches is not None and step >= num_batches:
                 break
 
+            # --- A. Move Batch to Device ---
             if hasattr(batch, "items"):
                 batch_input = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
                 outputs = model(**batch_input)
@@ -231,6 +244,7 @@ def compute_gradient_importance_scores(
             else:
                 outputs = model(batch.to(device))
 
+            # --- B. Get Loss ---
             if isinstance(outputs, dict) and "loss" in outputs:
                 loss = outputs["loss"]
             elif hasattr(outputs, "loss"):
@@ -242,6 +256,7 @@ def compute_gradient_importance_scores(
 
             loss.backward()
 
+            # --- C. Accumulate Scores ---
             for name, act in current_batch_activations.items():
                 if act.grad is None:
                     continue
@@ -249,6 +264,7 @@ def compute_gradient_importance_scores(
                 a_flat = act.detach().view(-1, act.size(-1))
                 g_flat = act.grad.detach().view(-1, act.size(-1))
 
+                # Importance = Mean(Abs(Gradient * Activation))
                 importance = (a_flat * g_flat).sum(dim=1).abs().mean().item()
                 accumulated_scores[name] += importance
 
@@ -262,8 +278,20 @@ def compute_gradient_importance_scores(
     if batches_processed == 0:
         return {k: 0.0 for k in lora_layers.keys()}
 
-    # 🔥 **NO NORMALIZATION HERE — returning raw averaged scores**
-    final_scores = {k: v / batches_processed for k, v in accumulated_scores.items()}
+    # 3. Average and Normalize
+    # Calculate raw average first
+    raw_scores = {k: v / batches_processed for k, v in accumulated_scores.items()}
+
+    # Min-Max Normalization to [0, 1] range for readable logging
+    s_vals = torch.tensor(list(raw_scores.values()), dtype=torch.float32)
+    eps = 1e-8
+    s_min, s_max = s_vals.min(), s_vals.max()
+
+    if (s_max - s_min) < eps:
+        normed = {k: 0.0 for k in raw_scores.keys()}
+    else:
+        s_norm = (s_vals - s_min) / (s_max - s_min)
+        normed = {k: float(v) for k, v in zip(raw_scores.keys(), s_norm)}
 
     model.train()
-    return final_scores
+    return normed
