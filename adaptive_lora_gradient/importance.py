@@ -160,36 +160,21 @@
 #     model.train()
 #     return normed
 
-import torch
-from torch.utils.data import DataLoader
-from typing import Dict, Optional
-import logging
-from tqdm.auto import tqdm
-from .utils import get_lora_layers
-
-logger = logging.getLogger(__name__)
 
 def compute_gradient_importance_scores(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    num_batches: Optional[int] = None, # None = Process All
-    batch_size: int = 8                # Controls memory usage per step
+    num_batches: Optional[int] = None,
+    batch_size: int = 8
 ) -> Dict[str, float]:
-    """
-    Computes per-layer importance scores iteratively (Memory Safe).
-    Calculates (Activation * Gradient) per batch and accumulates the sum.
-    
-    Returns:
-        Dict[str, float]: Raw averaged importance scores (NOT normalized).
-    """
+
     model.eval()
     lora_layers = get_lora_layers(model)
     if not lora_layers:
         logger.warning("No LoRA layers found. Returning empty scores.")
         return {}
 
-    # 1. Adjust Batch Size if needed
     if batch_size != dataloader.batch_size:
         logger.info(f"Adjusting DataLoader batch size from {dataloader.batch_size} to {batch_size}")
         dataloader = DataLoader(
@@ -201,13 +186,9 @@ def compute_gradient_importance_scores(
             pin_memory=dataloader.pin_memory
         )
 
-    # Dictionary to hold the running total of importance scores
     accumulated_scores = {name: 0.0 for name in lora_layers.keys()}
-    
-    # Temporary storage for the CURRENT batch's activations
     current_batch_activations = {}
 
-    # 2. Register Hooks
     def make_hook(name):
         def hook(module, inp, out):
             if isinstance(out, torch.Tensor):
@@ -233,27 +214,23 @@ def compute_gradient_importance_scores(
         total_steps = min(num_batches, total_steps)
 
     batches_processed = 0
-
-    # 3. Iterative Processing Loop
     model.zero_grad(set_to_none=True)
-    
+
     with torch.enable_grad():
         for step, batch in tqdm(enumerate(dataloader), total=total_steps, desc="Computing Importance", leave=False):
-            
+
             if num_batches is not None and step >= num_batches:
                 break
 
-            # --- A. Move Batch to Device ---
             if hasattr(batch, "items"):
                 batch_input = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
                 outputs = model(**batch_input)
             elif isinstance(batch, (list, tuple)):
                 batch_input = [b.to(device) for b in batch if isinstance(b, torch.Tensor)]
                 outputs = model(*batch_input)
-            else: # Tensor
+            else:
                 outputs = model(batch.to(device))
 
-            # --- B. Get Loss ---
             if isinstance(outputs, dict) and "loss" in outputs:
                 loss = outputs["loss"]
             elif hasattr(outputs, "loss"):
@@ -263,10 +240,8 @@ def compute_gradient_importance_scores(
             else:
                 continue
 
-            # --- C. Backward Pass ---
             loss.backward()
 
-            # --- D. Compute Score for this Batch ---
             for name, act in current_batch_activations.items():
                 if act.grad is None:
                     continue
@@ -274,12 +249,9 @@ def compute_gradient_importance_scores(
                 a_flat = act.detach().view(-1, act.size(-1))
                 g_flat = act.grad.detach().view(-1, act.size(-1))
 
-                # Eq 1.3: Absolute value of (Gradient * Activation)
                 importance = (a_flat * g_flat).sum(dim=1).abs().mean().item()
-                
                 accumulated_scores[name] += importance
 
-            # --- E. Cleanup ---
             current_batch_activations.clear()
             model.zero_grad(set_to_none=True)
             batches_processed += 1
@@ -290,6 +262,7 @@ def compute_gradient_importance_scores(
     if batches_processed == 0:
         return {k: 0.0 for k in lora_layers.keys()}
 
+    # 🔥 **NO NORMALIZATION HERE — returning raw averaged scores**
     final_scores = {k: v / batches_processed for k, v in accumulated_scores.items()}
 
     model.train()
