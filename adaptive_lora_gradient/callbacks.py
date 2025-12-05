@@ -157,8 +157,6 @@
 #                     f"📄 Epoch {epoch}: Rank allocations logged to {self.log_file}\n"
 #                 )
 
-
-
 import os
 import logging
 import torch
@@ -223,6 +221,8 @@ class AdaptiveLoRACallback(TrainerCallback):
         if self.verbose:
             print(f"\n--- AdaptiveLoRA: Preparing ranks for Epoch {epoch} ---")
 
+        # Use the device of the model parameters for importance calculation
+        # (compute_gradient_importance_scores handles moving batches internally)
         device = next(model.parameters()).device
 
         # 1️⃣ Compute BI scores BEFORE training
@@ -314,9 +314,10 @@ class AdaptiveLoRACallback(TrainerCallback):
                 if new_rank > current_rank:
                     # PAD: Keep old A, fill new rows with zeros
                     pad_rows = new_rank - current_rank
+                    # FIX: Use old_A.device explicitly
                     new_A_weight = torch.cat([
                         old_A, 
-                        torch.zeros((pad_rows, old_A.shape[1]), device=device, dtype=old_A.dtype)
+                        torch.zeros((pad_rows, old_A.shape[1]), device=old_A.device, dtype=old_A.dtype)
                     ], dim=0)
                 else:
                     # TRUNCATE: Keep top 'new_rank' rows
@@ -326,9 +327,10 @@ class AdaptiveLoRACallback(TrainerCallback):
                 if new_rank > current_rank:
                     # PAD: Keep old B, fill new cols with zeros
                     pad_cols = new_rank - current_rank
+                    # FIX: Use old_B.device explicitly
                     new_B_weight = torch.cat([
                         old_B, 
-                        torch.zeros((old_B.shape[0], pad_cols), device=device, dtype=old_B.dtype)
+                        torch.zeros((old_B.shape[0], pad_cols), device=old_B.device, dtype=old_B.dtype)
                     ], dim=1)
                 else:
                     # TRUNCATE: Keep left 'new_rank' cols
