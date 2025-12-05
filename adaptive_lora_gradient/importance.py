@@ -290,9 +290,6 @@ def compute_gradient_importance_scores(
     if batches_processed == 0:
         return {k: 0.0 for k in lora_layers.keys()}
 
-    # 4. Average Only (Normalization Removed)
-    # The normalization is now handled by 'allocate_ranks_bi' in allocation.py
-    # This allows us to see the raw importance magnitude in the logs.
     final_scores = {k: v / batches_processed for k, v in accumulated_scores.items()}
 
     model.train()
