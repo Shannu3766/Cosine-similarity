@@ -1,22 +1,19 @@
 import os
 import logging
+from typing import Dict, Optional
 from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
 from .importance import compute_gradient_importance_scores
 from .allocation import allocate_ranks_bi
-# Added resize_lora_layer_svd to imports
-from .utils import get_lora_layers, save_epoch_log, resize_lora_layer_svd 
+from .utils import get_lora_layers, save_epoch_log, resize_lora_layer_svd
 
 logger = logging.getLogger(__name__)
 
 class AdaptiveLoRACallback(TrainerCallback):
     """
-    Adaptive LoRA callback that:
-    - Computes Block Influence (BI) scores *before each epoch*.
-    - Allocates new ranks before training that epoch.
-    - Logs and saves rank evolution after each epoch.
-    - Uses SVD resizing to preserve weights when rank changes.
-
-    Works across Causal LM, Classification, and QA tasks.
+    Adaptive LoRA callback with Stability Improvements:
+    - SVD Resizing (Preserves weights).
+    - EMA Smoothing (Prevents rank thrashing).
+    - Warmup/Cooldown/Intervals (Stabilizes training).
     """
 
     def __init__(
@@ -26,9 +23,14 @@ class AdaptiveLoRACallback(TrainerCallback):
         tau: float = 1.0,
         log_path: str = "./logs",
         verbose: bool = True,
-        lora_alpha: int = 4,
+        lora_alpha: int = 16, # Increased default alpha for stability
         validate_batch_size: int = 8,
-        min_rank: int = 4
+        min_rank: int = 4,
+        # --- NEW STABILITY HYPERPARAMETERS ---
+        score_smoothing_beta: float = 0.85, # 0.0 = No history, 0.9 = Heavy smoothing
+        update_interval: int = 2,           # Update ranks every N epochs
+        warmup_epochs: int = 1,             # Don't adapt for first N epochs
+        cooldown_epochs: int = 2            # Stop adapting N epochs before end
     ):
         self.total_rank = total_rank
         self.val_dataloader = val_dataloader
@@ -38,16 +40,21 @@ class AdaptiveLoRACallback(TrainerCallback):
         self.lora_alpha = lora_alpha
         self.validate_batch_size = validate_batch_size
         self.min_rank = min_rank
+        
+        # Stability params
+        self.score_smoothing_beta = score_smoothing_beta
+        self.update_interval = update_interval
+        self.warmup_epochs = warmup_epochs
+        self.cooldown_epochs = cooldown_epochs
 
         os.makedirs(log_path, exist_ok=True)
 
-        # For storing the latest scores/ranks per epoch
         self.latest_scores = {}
         self.latest_ranks = {}
+        
+        # Store EMA scores here
+        self.ema_scores: Optional[Dict[str, float]] = None
 
-    # ============================================================
-    # 🔁 EPOCH-BEGIN: Compute and apply ranks before training
-    # ============================================================
     def on_epoch_begin(
         self,
         args: TrainingArguments,
@@ -56,41 +63,75 @@ class AdaptiveLoRACallback(TrainerCallback):
         model,
         **kwargs
     ):
-        # Handle pre-training (state.epoch is None before training starts)
-        epoch = int(state.epoch) + 1 if state.epoch is not None else 0
+        # Current epoch (1-based for logic)
+        epoch = int(state.epoch) + 1 if state.epoch is not None else 1
+        total_epochs = args.num_train_epochs
+
+        # --- 1. SCHEDULING CHECKS ---
+        # Skip if in warmup
+        if epoch <= self.warmup_epochs:
+            if self.verbose:
+                print(f"⏳ AdaptiveLoRA: Warmup (Epoch {epoch}). Skipping update.")
+            return
+
+        # Skip if in cooldown (near end of training)
+        if epoch > (total_epochs - self.cooldown_epochs):
+            if self.verbose:
+                print(f"🔒 AdaptiveLoRA: Cooldown (Epoch {epoch}). Architecture frozen.")
+            return
+
+        # Skip if not the right interval
+        if (epoch - self.warmup_epochs) % self.update_interval != 0:
+            if self.verbose:
+                print(f"⏭️ AdaptiveLoRA: Interval skip (Epoch {epoch}). Keeping ranks.")
+            return
 
         if self.verbose:
-            print(f"\n--- AdaptiveLoRA: Preparing ranks for Epoch {epoch} ---")
+            print(f"\n--- AdaptiveLoRA: Adapting Ranks for Epoch {epoch} ---")
 
         device = next(model.parameters()).device
 
-        # 1️⃣ Compute BI scores BEFORE training
-        if self.verbose:
-            print("Computing BI importance scores (pre-training)...")
-        scores = compute_gradient_importance_scores(model, self.val_dataloader, device, batch_size=self.validate_batch_size)
-        if not scores:
-            if self.verbose:
-                print("⚠️ No LoRA layers or BI scores found. Skipping rank update.")
+        # --- 2. COMPUTE RAW SCORES ---
+        raw_scores = compute_gradient_importance_scores(
+            model, 
+            self.val_dataloader, 
+            device, 
+            batch_size=self.validate_batch_size
+        )
+        
+        if not raw_scores:
+            logger.warning("No scores computed. Skipping.")
             return
 
-        # 2️⃣ Allocate new ranks
-        if self.verbose:
-            print("Allocating new ranks based on BI scores...")
-        new_ranks = allocate_ranks_bi(scores, self.total_rank, self.tau, min_rank=self.min_rank)
+        # --- 3. APPLY EMA SMOOTHING ---
+        # This is the key to accuracy: Don't react to noise, react to trends.
+        if self.ema_scores is None:
+            self.ema_scores = raw_scores
+        else:
+            for name, score in raw_scores.items():
+                prev = self.ema_scores.get(name, 0.0)
+                # EMA Formula: New = Beta * Old + (1-Beta) * Current
+                self.ema_scores[name] = (
+                    self.score_smoothing_beta * prev + 
+                    (1.0 - self.score_smoothing_beta) * score
+                )
+        
+        # Use smoothed scores for allocation
+        final_scores = self.ema_scores
 
-        # 3️⃣ Apply new ranks to LoRA layers
-        if self.verbose:
-            print("Applying new ranks to LoRA modules for this epoch...")
+        # --- 4. ALLOCATE RANKS ---
+        new_ranks = allocate_ranks_bi(
+            final_scores, 
+            self.total_rank, 
+            self.tau, 
+            min_rank=self.min_rank
+        )
 
+        # --- 5. APPLY UPDATES (SVD) ---
         lora_layers = get_lora_layers(model)
         config = model.peft_config.get("default")
-        if not config:
-            logger.error("❌ PEFT config not found. Skipping update.")
-            return
-
-        # Extract config flags once to pass to the update function
+        
         update_kwargs = {
-            "init_lora_weights": getattr(config, "init_lora_weights", True),
             "use_rslora": getattr(config, "use_rslora", False),
             "use_dora": getattr(config, "use_dora", False),
             "use_qalora": getattr(config, "use_qalora", False),
@@ -98,30 +139,20 @@ class AdaptiveLoRACallback(TrainerCallback):
             "qalora_group_size": getattr(config, "qalora_group_size", 64),
         }
 
+        changes_count = 0
         for name, layer in lora_layers.items():
             new_rank = new_ranks.get(name)
-            if new_rank is None:
-                continue
+            if new_rank is None: continue
 
             current_rank = layer.r.get("default", 0)
-            score = scores.get(name, 0.0)
-
-            # Print all layers (even unchanged ones)
+            
             if current_rank != new_rank:
-                if self.verbose:
-                    print(f"  - {name}: r={current_rank} → {new_rank} (Score: {score:.4f})")
-            else:
-                if self.verbose:
-                    print(f"  - {name}: r={new_rank} (Unchanged, Score: {score:.4f})")
-
-            # Update rank if different
-            if current_rank != new_rank:
-                # Handle dropout extraction specifically
+                changes_count += 1
                 lora_dropout_p = 0.0
                 if hasattr(layer, "lora_dropout") and "default" in layer.lora_dropout:
                     lora_dropout_p = layer.lora_dropout["default"].p
 
-                # Use the new SVD-based resize function to preserve weights
+                # Use SVD Resize
                 resize_lora_layer_svd(
                     layer=layer,
                     new_rank=new_rank,
@@ -131,16 +162,13 @@ class AdaptiveLoRACallback(TrainerCallback):
                     **update_kwargs
                 )
 
-        # Save for logging after training
-        self.latest_scores = scores
+        # Save for logging
+        self.latest_scores = final_scores
         self.latest_ranks = new_ranks
 
         if self.verbose:
-            print(f"✅ AdaptiveLoRA: Rank setup for Epoch {epoch} complete.\n")
+            print(f"✅ AdaptiveLoRA: Updated {changes_count} layers. (Smoothed Score used)\n")
 
-    # ============================================================
-    # 📊 EPOCH-END: Log ranks and scores
-    # ============================================================
     def on_epoch_end(
         self,
         args: TrainingArguments,
@@ -150,10 +178,5 @@ class AdaptiveLoRACallback(TrainerCallback):
         **kwargs
     ):
         epoch = int(state.epoch) if state.epoch is not None else -1
-
         if self.latest_ranks and self.latest_scores:
             save_epoch_log(self.log_file, epoch, self.latest_ranks, self.latest_scores)
-            if self.verbose:
-                print(
-                    f"📄 Epoch {epoch}: Rank allocations logged to {self.log_file}\n"
-                )
